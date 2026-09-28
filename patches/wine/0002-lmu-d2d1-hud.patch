@@ -1,0 +1,625 @@
+diff --git a/dlls/d2d1/bitmap.c b/dlls/d2d1/bitmap.c
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -21,6 +21,17 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
++#define INITIAL_CLIP_STACK_SIZE 4
++
++static BOOL d2d_bitmap_clip_stack_init(struct d2d_clip_stack *stack)
++{
++    if (!(stack->stack = malloc(INITIAL_CLIP_STACK_SIZE * sizeof(*stack->stack))))
++        return FALSE;
++    stack->size = INITIAL_CLIP_STACK_SIZE;
++    stack->count = 0;
++    return TRUE;
++}
++
+ static inline struct d2d_bitmap *impl_from_ID2D1Bitmap1(ID2D1Bitmap1 *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_bitmap, ID2D1Bitmap1_iface);
+@@ -85,6 +96,7 @@
+ 
+     if (!refcount)
+     {
++        free(bitmap->clip_stack.stack);
+         if (bitmap->srv)
+             ID3D11ShaderResourceView_Release(bitmap->srv);
+         if (bitmap->rtv)
+@@ -407,6 +419,10 @@
+     bitmap->dpi_x = desc->dpiX;
+     bitmap->dpi_y = desc->dpiY;
+     bitmap->options = desc->bitmapOptions;
++    bitmap->is_tinted = FALSE;
++    bitmap->tint_colour = (D2D1_COLOR_F){1.0f, 1.0f, 1.0f, 1.0f};
++    if (!d2d_bitmap_clip_stack_init(&bitmap->clip_stack))
++        WARN("Failed to initialize bitmap clip stack.\n");
+ 
+     if (d2d_device_context_is_dxgi_target(context))
+         ID3D11Resource_QueryInterface(resource, &IID_IDXGISurface, (void **)&bitmap->surface);
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -36,6 +36,10 @@
+ #endif
+ #include "dwrite_2.h"
+ 
++/* Introduced in d2d1effects_2.h on Windows 10, but not yet exposed by Wine's headers. */
++DEFINE_GUID(CLSID_D2D1Tint, 0x36312b17, 0xf7dd, 0x4014, 0x91, 0x5d, 0xff, 0xca, 0x76, 0x8c, 0xf2, 0x11);
++#define D2D1_TINT_PROP_COLOR 0
++
+ enum d2d_brush_type
+ {
+     D2D_BRUSH_TYPE_SOLID,
+@@ -65,6 +69,13 @@
+ struct d2d_clip_stack
+ {
+     D2D1_RECT_F *stack;
++    size_t size;
++    size_t count;
++};
++
++struct d2d_layer_stack
++{
++    struct d2d_layer **stack;
+     size_t size;
+     size_t count;
+ };
+@@ -120,9 +131,11 @@
+ {
+     BOOL outline;
+     BOOL is_arc;
+-    BOOL pad[2];
++    BOOL is_tinted;
++    BOOL pad;
+     struct d2d_brush_cb colour_brush;
+     struct d2d_brush_cb opacity_brush;
++    D2D1_COLOR_F tint_colour;
+ };
+ 
+ struct d2d_vec4
+@@ -218,7 +231,7 @@
+ 
+     D2D1_RENDER_TARGET_PROPERTIES desc;
+     D2D1_SIZE_U pixel_size;
+-    struct d2d_clip_stack clip_stack;
++    struct d2d_layer_stack layer_stack;
+ 
+     struct d2d_indexed_objects vertex_buffers;
+ };
+@@ -406,9 +419,14 @@
+ 
+     ID2D1Factory *factory;
+     D2D1_SIZE_F size;
++    D2D1_LAYER_PARAMETERS1 parameters;
++    ID2D1Image *previous_target;
++    ID2D1Bitmap1 *offscreen_bitmap;
++    D2D1_MATRIX_3X2_F previous_transform;
+ };
+ 
+ HRESULT d2d_layer_create(ID2D1Factory *factory, const D2D1_SIZE_F *size, struct d2d_layer **layer);
++struct d2d_layer *unsafe_impl_from_ID2D1Layer(ID2D1Layer *iface);
+ 
+ enum d2d_mesh_state
+ {
+@@ -449,6 +467,9 @@
+     float dpi_x;
+     float dpi_y;
+     D2D1_BITMAP_OPTIONS options;
++    BOOL is_tinted;
++    D2D1_COLOR_F tint_colour;
++    struct d2d_clip_stack clip_stack;
+ };
+ 
+ HRESULT d2d_bitmap_create(struct d2d_device_context *context, D2D1_SIZE_U size, const void *src_data,
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -22,6 +22,7 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+ #define INITIAL_CLIP_STACK_SIZE 4
++#define INITIAL_LAYER_STACK_SIZE 4
+ 
+ static const D2D1_MATRIX_3X2_F identity =
+ {{{
+@@ -78,20 +79,86 @@
+     dst->height = height;
+ }
+ 
+-static BOOL d2d_clip_stack_init(struct d2d_clip_stack *stack)
+-{
+-    if (!(stack->stack = malloc(INITIAL_CLIP_STACK_SIZE * sizeof(*stack->stack))))
++static void d2d_device_context_set_error(struct d2d_device_context *context, HRESULT code);
++static inline struct d2d_device_context *impl_from_ID2D1DeviceContext(ID2D1DeviceContext6 *iface);
++
++static BOOL d2d_layer_stack_init(struct d2d_layer_stack *stack)
++{
++    if (!(stack->stack = malloc(INITIAL_LAYER_STACK_SIZE * sizeof(*stack->stack))))
+         return FALSE;
+-
+-    stack->size = INITIAL_CLIP_STACK_SIZE;
++    stack->size = INITIAL_LAYER_STACK_SIZE;
+     stack->count = 0;
+-
+     return TRUE;
+ }
+ 
+-static void d2d_clip_stack_cleanup(struct d2d_clip_stack *stack)
+-{
++static void d2d_layer_stack_cleanup(struct d2d_layer_stack *stack)
++{
++    while (stack->count)
++        ID2D1Layer_Release(&stack->stack[--stack->count]->ID2D1Layer_iface);
+     free(stack->stack);
++}
++
++static BOOL d2d_layer_stack_push(struct d2d_layer_stack *stack, struct d2d_layer *layer)
++{
++    if (!d2d_array_reserve((void **)&stack->stack, &stack->size,
++            stack->count + 1, sizeof(*stack->stack)))
++        return FALSE;
++    stack->stack[stack->count++] = layer;
++    return TRUE;
++}
++
++static struct d2d_layer *d2d_layer_stack_pop(struct d2d_layer_stack *stack)
++{
++    if (!stack->count) return NULL;
++    return stack->stack[--stack->count];
++}
++
++static void d2d_device_context_push_layer_impl(ID2D1DeviceContext6 *iface,
++        const D2D1_LAYER_PARAMETERS1 *parameters, ID2D1Layer *layer_iface)
++{
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    D2D1_BITMAP_PROPERTIES1 desc = {0};
++    struct d2d_layer *layer;
++    D2D1_SIZE_F size;
++    float dpi_x, dpi_y;
++    HRESULT hr;
++
++    size.width = context->pixel_size.width;
++    size.height = context->pixel_size.height;
++    if (layer_iface)
++    {
++        layer = unsafe_impl_from_ID2D1Layer(layer_iface);
++        ID2D1Layer_AddRef(layer_iface);
++    }
++    else if (FAILED(hr = d2d_layer_create(context->factory, &size, &layer)))
++    {
++        d2d_device_context_set_error(context, hr);
++        return;
++    }
++
++    layer->parameters = *parameters;
++    ID2D1DeviceContext6_GetTarget(iface, &layer->previous_target);
++    ID2D1DeviceContext6_GetTransform(iface, &layer->previous_transform);
++    ID2D1DeviceContext6_GetDpi(iface, &dpi_x, &dpi_y);
++    desc.pixelFormat = context->target.bitmap->format;
++    desc.dpiX = dpi_x;
++    desc.dpiY = dpi_y;
++    desc.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
++    if (FAILED(hr = ID2D1DeviceContext6_CreateBitmap(iface, context->pixel_size, NULL, 0,
++            &desc, &layer->offscreen_bitmap)))
++    {
++        ID2D1Layer_Release(&layer->ID2D1Layer_iface);
++        d2d_device_context_set_error(context, hr);
++        return;
++    }
++    if (!d2d_layer_stack_push(&context->layer_stack, layer))
++    {
++        ID2D1Layer_Release(&layer->ID2D1Layer_iface);
++        d2d_device_context_set_error(context, E_OUTOFMEMORY);
++        return;
++    }
++    ID2D1DeviceContext6_SetTarget(iface, (ID2D1Image *)layer->offscreen_bitmap);
++    ID2D1DeviceContext6_Clear(iface, &(D2D1_COLOR_F){0.0f, 0.0f, 0.0f, 0.0f});
+ }
+ 
+ static BOOL d2d_clip_stack_push(struct d2d_clip_stack *stack, const D2D1_RECT_F *rect)
+@@ -114,6 +181,11 @@
+     if (!stack->count)
+         return;
+     --stack->count;
++}
++
++static struct d2d_clip_stack *d2d_device_context_get_clip_stack(struct d2d_device_context *context)
++{
++    return context->target.type == D2D_TARGET_BITMAP ? &context->target.bitmap->clip_stack : NULL;
+ }
+ 
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+@@ -125,6 +197,7 @@
+     ID3D11Device1 *device = render_target->d3d_device;
+     ID3D11DeviceContext1 *context;
+     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
++    struct d2d_clip_stack *clip_stack;
+     D3D11_RECT scissor_rect;
+     unsigned int offset;
+     D3D11_VIEWPORT vp;
+@@ -152,11 +225,12 @@
+     ID3D11DeviceContext1_PSSetConstantBuffers(context, 0, 1, &ps_cb);
+     ID3D11DeviceContext1_PSSetShader(context, render_target->ps, NULL, 0);
+     ID3D11DeviceContext1_RSSetViewports(context, 1, &vp);
+-    if (render_target->clip_stack.count)
++    clip_stack = d2d_device_context_get_clip_stack(render_target);
++    if (clip_stack && clip_stack->count)
+     {
+         const D2D1_RECT_F *clip_rect;
+ 
+-        clip_rect = &render_target->clip_stack.stack[render_target->clip_stack.count - 1];
++        clip_rect = &clip_stack->stack[clip_stack->count - 1];
+         scissor_rect.left = ceilf(clip_rect->left - 0.5f);
+         scissor_rect.top = ceilf(clip_rect->top - 0.5f);
+         scissor_rect.right = ceilf(clip_rect->right - 0.5f);
+@@ -270,7 +344,7 @@
+     {
+         unsigned int i, j, k;
+ 
+-        d2d_clip_stack_cleanup(&context->clip_stack);
++        d2d_layer_stack_cleanup(&context->layer_stack);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+             IDWriteRenderingParams_Release(context->text_rendering_params);
+@@ -788,12 +862,14 @@
+     cb_data = map_desc.pData;
+     cb_data->outline = outline;
+     cb_data->is_arc = is_arc;
+-    cb_data->pad[0] = 0;
+-    cb_data->pad[1] = 0;
++    cb_data->is_tinted = context->target.bitmap && context->target.bitmap->is_tinted;
++    cb_data->pad = 0;
+     if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
+         WARN("Failed to initialize colour brush buffer.\n");
+     if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
+         WARN("Failed to initialize opacity brush buffer.\n");
++    cb_data->tint_colour = context->target.bitmap
++            ? context->target.bitmap->tint_colour : (D2D1_COLOR_F){1.0f, 1.0f, 1.0f, 1.0f};
+ 
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->ps_cb, 0);
+     ID3D11DeviceContext_Release(d3d_context);
+@@ -1844,8 +1920,6 @@
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    FIXME("iface %p, layer_parameters %p, layer %p stub!\n", iface, layer_parameters, layer);
+-
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+         D2D1_LAYER_PARAMETERS1 parameters;
+@@ -1853,6 +1927,14 @@
+         memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
+         parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
+         d2d_command_list_push_layer(context->target.command_list, context, &parameters);
++        return;
++    }
++
++    {
++        D2D1_LAYER_PARAMETERS1 parameters;
++        memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
++        parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
++        d2d_device_context_push_layer_impl(iface, &parameters, layer);
+     }
+ }
+ 
+@@ -1860,10 +1942,69 @@
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    FIXME("iface %p stub!\n", iface);
+-
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    {
+         d2d_command_list_pop_layer(context->target.command_list);
++    }
++    else
++    {
++        struct d2d_layer *layer = d2d_layer_stack_pop(&context->layer_stack);
++        D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_desc;
++        D2D1_BRUSH_PROPERTIES brush_desc;
++        ID2D1TransformedGeometry *geometry = NULL;
++        D2D1_MATRIX_3X2_F mask_transform, opacity_transform;
++        struct d2d_brush *brush = NULL;
++        D2D1_RECT_F source;
++        HRESULT hr;
++
++        if (!layer)
++        {
++            d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++            return;
++        }
++        source = (D2D1_RECT_F){0.0f, 0.0f, context->pixel_size.width, context->pixel_size.height};
++        ID2D1DeviceContext6_SetTarget(iface, layer->previous_target);
++        ID2D1DeviceContext6_SetTransform(iface, &identity);
++        if (layer->parameters.geometricMask && layer->parameters.opacityBrush)
++        {
++            bitmap_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
++            bitmap_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
++            bitmap_desc.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
++            brush_desc.opacity = layer->parameters.opacity;
++            brush_desc.transform = identity;
++
++            hr = d2d_bitmap_brush_create(context->factory, (ID2D1Bitmap *)layer->offscreen_bitmap,
++                    &bitmap_desc, &brush_desc, &brush);
++            mask_transform = layer->parameters.maskTransform;
++            d2d_matrix_multiply(&mask_transform, &layer->previous_transform);
++            if (SUCCEEDED(hr))
++                hr = ID2D1Factory_CreateTransformedGeometry(context->factory,
++                        layer->parameters.geometricMask, &mask_transform, &geometry);
++            if (SUCCEEDED(hr))
++            {
++                ID2D1Brush_GetTransform(layer->parameters.opacityBrush, &opacity_transform);
++                brush_desc.transform = opacity_transform;
++                d2d_matrix_multiply(&opacity_transform, &layer->previous_transform);
++                ID2D1Brush_SetTransform(layer->parameters.opacityBrush, &opacity_transform);
++                ID2D1DeviceContext6_FillGeometry(iface, (ID2D1Geometry *)geometry,
++                        &brush->ID2D1Brush_iface, layer->parameters.opacityBrush);
++                ID2D1Brush_SetTransform(layer->parameters.opacityBrush, &brush_desc.transform);
++            }
++            if (geometry)
++                ID2D1TransformedGeometry_Release(geometry);
++            if (brush)
++                ID2D1Brush_Release(&brush->ID2D1Brush_iface);
++            if (FAILED(hr))
++                d2d_device_context_set_error(context, hr);
++        }
++        else
++        {
++            ID2D1DeviceContext6_DrawBitmap(iface, (ID2D1Bitmap *)layer->offscreen_bitmap,
++                    &source, layer->parameters.opacity, D2D1_INTERPOLATION_MODE_LINEAR, &source, NULL);
++        }
++        ID2D1DeviceContext6_SetTransform(iface, &layer->previous_transform);
++        ID2D1Layer_Release(&layer->ID2D1Layer_iface);
++    }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_Flush(ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2)
+@@ -1937,7 +2078,13 @@
+     TRACE("iface %p, clip_rect %s, antialias_mode %#x.\n", iface, debug_d2d_rect_f(clip_rect), antialias_mode);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    {
+         d2d_command_list_push_clip(context->target.command_list, clip_rect, antialias_mode);
++        return;
++    }
++
++    if (context->target.type != D2D_TARGET_BITMAP)
++        return;
+ 
+     if (antialias_mode != D2D1_ANTIALIAS_MODE_ALIASED)
+         FIXME("Ignoring antialias_mode %#x.\n", antialias_mode);
+@@ -1957,7 +2104,7 @@
+             clip_rect->right * x_scale, clip_rect->bottom * y_scale);
+     d2d_rect_expand(&transformed_rect, &point);
+ 
+-    if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
++    if (!d2d_clip_stack_push(d2d_device_context_get_clip_stack(context), &transformed_rect))
+         WARN("Failed to push clip rect.\n");
+ }
+ 
+@@ -1968,9 +2115,13 @@
+     TRACE("iface %p.\n", iface);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    {
+         d2d_command_list_pop_clip(context->target.command_list);
+-
+-    d2d_clip_stack_pop(&context->clip_stack);
++        return;
++    }
++
++    if (context->target.type == D2D_TARGET_BITMAP)
++        d2d_clip_stack_pop(d2d_device_context_get_clip_stack(context));
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *iface, const D2D1_COLOR_F *colour)
+@@ -2727,6 +2878,7 @@
+         D2D1_COMPOSITE_MODE composite_mode)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    ID2D1Effect *effect;
+     ID2D1Bitmap *bitmap;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+@@ -2751,6 +2903,54 @@
+ 
+     if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+         FIXME("Unhandled composite mode %#x.\n", composite_mode);
++
++    /* LMU uses the Tint effect with a single bitmap input. Wine does not render effects yet,
++     * but drawing that input matches the established LMU Proton fallback. */
++    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Effect, (void **)&effect)))
++    {
++        ID2D1Image *input = NULL;
++        D2D1_COLOR_F previous_tint_colour, tint_colour;
++        BOOL previous_is_tinted;
++        CLSID effect_id;
++        BOOL tint = FALSE;
++
++        if (ID2D1Effect_GetInputCount(effect) == 1)
++            ID2D1Effect_GetInput(effect, 0, &input);
++        if (input && SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
++        {
++            if (context->target.bitmap
++                    && SUCCEEDED(ID2D1Effect_GetValue(effect, D2D1_PROPERTY_CLSID,
++                            D2D1_PROPERTY_TYPE_CLSID, (BYTE *)&effect_id, sizeof(effect_id)))
++                    && IsEqualCLSID(&effect_id, &CLSID_D2D1Tint)
++                    && SUCCEEDED(ID2D1Effect_GetValue(effect, D2D1_TINT_PROP_COLOR,
++                            D2D1_PROPERTY_TYPE_VECTOR4, (BYTE *)&tint_colour, sizeof(tint_colour))))
++            {
++                previous_is_tinted = context->target.bitmap->is_tinted;
++                previous_tint_colour = context->target.bitmap->tint_colour;
++                context->target.bitmap->is_tinted = TRUE;
++                context->target.bitmap->tint_colour = tint_colour;
++                tint = TRUE;
++            }
++
++            d2d_device_context_draw_bitmap(context, bitmap, NULL, 1.0f, interpolation_mode,
++                    image_rect, target_offset, NULL);
++
++            if (tint)
++            {
++                context->target.bitmap->is_tinted = previous_is_tinted;
++                context->target.bitmap->tint_colour = previous_tint_colour;
++            }
++            ID2D1Bitmap_Release(bitmap);
++        }
++        else
++        {
++            FIXME("Unhandled effect input %p.\n", input);
++        }
++
++        if (input) ID2D1Image_Release(input);
++        ID2D1Effect_Release(effect);
++        return;
++    }
+ 
+     if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
+     {
+@@ -2807,10 +3007,10 @@
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    FIXME("iface %p, layer_parameters %p, layer %p stub!\n", iface, layer_parameters, layer);
+-
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
++    else
++        d2d_device_context_push_layer_impl(iface, layer_parameters, layer);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_InvalidateEffectInputRectangle(ID2D1DeviceContext6 *iface,
+@@ -3091,7 +3291,27 @@
+     }
+     else
+     {
+-        FIXME("Unimplemented for bitmap render target.\n");
++        D2D1_MATRIX_3X2_F previous_transform;
++        D2D1_RECT_F source_rect;
++        unsigned int i;
++
++        ID2D1DeviceContext6_GetTransform(iface, &previous_transform);
++        for (i = start_index; i < start_index + sprite_count; ++i)
++        {
++            const struct d2d_sprite *sprite = &batch->sprites[i];
++
++            source_rect.left = sprite->source.left;
++            source_rect.top = sprite->source.top;
++            source_rect.right = sprite->source.right;
++            source_rect.bottom = sprite->source.bottom;
++            ID2D1DeviceContext6_SetTransform(iface, &sprite->transform);
++            context->target.bitmap->is_tinted = TRUE;
++            context->target.bitmap->tint_colour = sprite->color;
++            ID2D1DeviceContext6_DrawBitmap(iface, bitmap, &sprite->dest, sprite->color.a,
++                    interpolation_mode, &source_rect, NULL);
++            context->target.bitmap->is_tinted = FALSE;
++        }
++        ID2D1DeviceContext6_SetTransform(iface, &previous_transform);
+     }
+ }
+ 
+@@ -4021,12 +4241,15 @@
+     "\n"
+     "bool outline;\n"
+     "bool is_arc;\n"
++    "bool is_tinted;\n"
++    "bool padding;\n"
+     "struct brush\n"
+     "{\n"
+     "    uint type;\n"
+     "    float opacity;\n"
+     "    float4 data[3];\n"
+     "} colour_brush, opacity_brush;\n"
++    "float4 tint_colour;\n"
+     "\n"
+     "SamplerState s0, s1;\n"
+     "Texture2D t0, t1;\n"
+@@ -4155,6 +4378,8 @@
+     "    float4 colour;\n"
+     "\n"
+     "    colour = sample_brush(colour_brush, t0, s0, b0, i.p);\n"
++    "    if (is_tinted)\n"
++    "        colour *= tint_colour;\n"
+     "    if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
+     "        colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
+     "\n"
+@@ -4416,9 +4641,9 @@
+ 
+     render_target->drawing_state.transform = identity;
+ 
+-    if (!d2d_clip_stack_init(&render_target->clip_stack))
+-    {
+-        WARN("Failed to initialize clip stack.\n");
++    if (!d2d_layer_stack_init(&render_target->layer_stack))
++    {
++        WARN("Failed to initialize layer stack.\n");
+         hr = E_FAIL;
+         goto err;
+     }
+diff --git a/dlls/d2d1/effect.c b/dlls/d2d1/effect.c
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -1348,6 +1348,25 @@
+     return d2d_effect_create_impl(effect, NULL, 0);
+ }
+ 
++static const WCHAR tint_description[] =
++L"<?xml version='1.0'?>                                                   \
++  <Effect>                                                                \
++    <Property name='DisplayName' type='string' value='Tint'/>             \
++    <Property name='Author'      type='string' value='The Wine Project'/> \
++    <Property name='Category'    type='string' value='Stub'/>             \
++    <Property name='Description' type='string' value='Tint'/>             \
++    <Inputs>                                                              \
++      <Input name='Source'/>                                              \
++    </Inputs>                                                             \
++    <Property name='Color' type='vector4'/>                               \
++    <Property name='ClampOutput' type='bool'/>                            \
++  </Effect>";
++
++static HRESULT __stdcall tint_factory(IUnknown **effect)
++{
++    return d2d_effect_create_impl(effect, NULL, 0);
++}
++
+ static const WCHAR color_matrix_description[] =
+ L"<?xml version='1.0'?>                                                   \
+   <Effect>                                                                \
+@@ -1824,6 +1843,7 @@
+         { &CLSID_D2D1Crop, X2(crop) },
+         { &CLSID_D2D1Shadow, X2(shadow) },
+         { &CLSID_D2D1Grayscale, X(grayscale) },
++        { &CLSID_D2D1Tint, X(tint) },
+         { &CLSID_D2D1ColorMatrix, X2(color_matrix) },
+         { &CLSID_D2D1Flood, X2(flood) },
+         { &CLSID_D2D1GaussianBlur, X2(gaussian_blur) },
+diff --git a/dlls/d2d1/layer.c b/dlls/d2d1/layer.c
+--- a/dlls/d2d1/layer.c
++++ b/dlls/d2d1/layer.c
+@@ -63,6 +63,10 @@
+ 
+     if (!refcount)
+     {
++        if (layer->offscreen_bitmap)
++            ID2D1Bitmap1_Release(layer->offscreen_bitmap);
++        if (layer->previous_target)
++            ID2D1Image_Release(layer->previous_target);
+         ID2D1Factory_Release(layer->factory);
+         free(layer);
+     }
+@@ -98,6 +102,13 @@
+     d2d_layer_GetSize,
+ };
+ 
++struct d2d_layer *unsafe_impl_from_ID2D1Layer(ID2D1Layer *iface)
++{
++    if (!iface) return NULL;
++    assert(iface->lpVtbl == &d2d_layer_vtbl);
++    return CONTAINING_RECORD(iface, struct d2d_layer, ID2D1Layer_iface);
++}
++
+ HRESULT d2d_layer_create(ID2D1Factory *factory, const D2D1_SIZE_F *size, struct d2d_layer **layer)
+ {
+     if (!(*layer = calloc(1, sizeof(**layer))))
